@@ -6,9 +6,11 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 import time
+import concurrent.futures
 import threading
 import json
 import os
+import requests
 from scipy.stats import norm
 import warnings
 warnings.filterwarnings('ignore')
@@ -131,21 +133,33 @@ html, body, [class*="css"] {
     max-height: 420px;
     overflow-y: auto;
 }
+
+.scan-info {
+    background: rgba(0,212,255,0.07);
+    border: 1px solid rgba(0,212,255,0.3);
+    border-radius: 10px;
+    padding: 14px 18px;
+    font-size: 0.85rem;
+    color: #94a3b8;
+    margin-bottom: 12px;
+}
 </style>
 """, unsafe_allow_html=True)
 
 # ─── Session State Init ────────────────────────────────────────────────────────
 def init_state():
     defaults = {
-        "portfolio": [],            # list of open positions
-        "history": [],              # closed trades
-        "watchlist": [],            # {"symbol": "RELIANCE.NS", "type": "CALL/PUT", "strike": x, "expiry": "..."}
+        "portfolio": [],
+        "history": [],
+        "watchlist": [],
         "auto_trading": False,
         "auto_trade_end": None,
-        "auto_trade_log": [],       # reasoning log
+        "auto_trade_log": [],
         "auto_pnl": 0.0,
-        "capital": 100000.0,        # starting capital in INR
+        "capital": 100000.0,
         "used_capital": 0.0,
+        "nse_symbols": [],           # dynamically fetched NSE symbols
+        "nse_fetched_at": None,      # when we last fetched the NSE list
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -153,15 +167,112 @@ def init_state():
 
 init_state()
 
-# ─── Core Functions ────────────────────────────────────────────────────────────
+# ─── Dynamic NSE Symbol Fetching ──────────────────────────────────────────────
 
-INDIAN_STOCKS = [
-    "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
-    "SBIN.NS","BAJFINANCE.NS","WIPRO.NS","AXISBANK.NS","KOTAKBANK.NS",
-    "LT.NS","HCLTECH.NS","ASIANPAINT.NS","MARUTI.NS","TITAN.NS",
-    "SUNPHARMA.NS","BHARTIARTL.NS","NESTLEIND.NS","ULTRACEMCO.NS","POWERGRID.NS",
-    "NIFTY50","BANKNIFTY","SENSEX"
+# Fallback broad list used only if live fetch fails (covers Nifty500 + key indices)
+FALLBACK_NSE_SYMBOLS = [
+    "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS","SBIN.NS",
+    "BAJFINANCE.NS","WIPRO.NS","AXISBANK.NS","KOTAKBANK.NS","LT.NS","HCLTECH.NS",
+    "ASIANPAINT.NS","MARUTI.NS","TITAN.NS","SUNPHARMA.NS","BHARTIARTL.NS",
+    "NESTLEIND.NS","ULTRACEMCO.NS","POWERGRID.NS","NTPC.NS","ONGC.NS","BPCL.NS",
+    "COALINDIA.NS","IOC.NS","GAIL.NS","ADANIENT.NS","ADANIPORTS.NS","ADANIGREEN.NS",
+    "TATAMOTORS.NS","TATASTEEL.NS","TATACONSUM.NS","CIPLA.NS","DIVISLAB.NS",
+    "DRREDDY.NS","APOLLOHOSP.NS","HINDALCO.NS","JSWSTEEL.NS","TECHM.NS",
+    "HDFCLIFE.NS","SBILIFE.NS","BAJAJFINSV.NS","EICHERMOT.NS","HEROMOTOCO.NS",
+    "BRITANNIA.NS","PIDILITIND.NS","DABUR.NS","MARICO.NS","COLPAL.NS",
+    "HAVELLS.NS","VOLTAS.NS","BERGEPAINT.NS","GODREJCP.NS","GRASIM.NS",
+    "INDUSINDBK.NS","BANDHANBNK.NS","FEDERALBNK.NS","IDFCFIRSTB.NS","PNB.NS",
+    "BANKBARODA.NS","CANBK.NS","UNIONBANK.NS","SAIL.NS","NMDC.NS",
+    "RECLTD.NS","PFC.NS","IRFC.NS","NHPC.NS","SJVN.NS",
+    "ZOMATO.NS","NYKAA.NS","PAYTM.NS","POLICYBZR.NS","DELHIVERY.NS",
+    "IRCTC.NS","HAPPSTMNDS.NS","PERSISTENT.NS","COFORGE.NS","MPHASIS.NS",
+    "LTIM.NS","OFSS.NS","KPITTECH.NS","TATAELXSI.NS",
+    "DIXON.NS","AMBER.NS","KAJARIAL.NS","CROMPTON.NS","BLUESTARCO.NS",
+    "PAGEIND.NS","RELAXO.NS","BATA.NS","VMART.NS","TRENT.NS",
+    "DMART.NS","ABFRL.NS","MANYAVAR.NS","SHOPERSTOP.NS",
+    "INDIGO.NS","SPICEJET.NS","CONCOR.NS","BLUEDART.NS","GICRE.NS",
+    "NIACL.NS","STARHEALTH.NS","HDFCAMC.NS","NIPPONLIFE.NS",
+    "PIDILITIND.NS","ASTRAL.NS","SUPREME.NS","FINOLEX.NS","POLYCAB.NS",
+    "CUMMINSIND.NS","BHEL.NS","ABB.NS","SIEMENS.NS","SCHNEIDER.NS",
+    "AMBUJACEM.NS","ACC.NS","SHREECEM.NS","RAMCOCEM.NS",
+    "MUTHOOTFIN.NS","MANAPPURAM.NS","CHOLAFIN.NS","SHRIRAMFIN.NS",
+    "AUROPHARMA.NS","TORNTPHARM.NS","LUPIN.NS","BIOCON.NS","IPCALAB.NS",
+    "ALKEM.NS","GLENMARK.NS","NATCOPHARM.NS","ZYDUSLIFE.NS",
+    "^NSEI","^NSEBANK","^BSESN"
 ]
+
+@st.cache_data(ttl=3600)   # refresh every hour
+def fetch_nse_all_symbols():
+    """
+    Fetch the complete list of NSE-listed equity symbols.
+    Strategy:
+      1. Try NSE official CSV (equity_L.csv) — most comprehensive (~2000 symbols)
+      2. Fall back to the broad hardcoded list if network is unavailable
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.nseindia.com"
+        }
+        # NSE's public equities list CSV
+        url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            from io import StringIO
+            df = pd.read_csv(StringIO(resp.text))
+            # Column is 'SYMBOL'
+            symbols = [s.strip() + ".NS" for s in df["SYMBOL"].dropna().tolist()]
+            # Add major indices
+            symbols += ["^NSEI", "^NSEBANK", "^BSESN"]
+            return symbols
+    except Exception:
+        pass
+
+    # Fallback
+    return FALLBACK_NSE_SYMBOLS
+
+
+def get_nse_symbols():
+    """Return cached NSE symbols, fetching if needed."""
+    symbols = fetch_nse_all_symbols()
+    return symbols if symbols else FALLBACK_NSE_SYMBOLS
+
+
+def filter_tradeable_symbols(symbols, min_price=50, max_price=50000, batch_size=200):
+    """
+    Quick-filter: keep only symbols that have live data and are within a price range.
+    Processes in batches using yfinance's download for speed.
+    Returns a deduplicated list of valid .NS symbols.
+    """
+    valid = []
+    # Remove indices for trading (keep only .NS equities)
+    equity_syms = [s for s in symbols if s.endswith(".NS")]
+
+    batches = [equity_syms[i:i+batch_size] for i in range(0, len(equity_syms), batch_size)]
+    for batch in batches:
+        try:
+            data = yf.download(batch, period="2d", interval="1d",
+                               group_by="ticker", threads=True,
+                               progress=False, auto_adjust=True)
+            for sym in batch:
+                try:
+                    if len(batch) == 1:
+                        close_series = data["Close"]
+                    else:
+                        close_series = data[sym]["Close"] if sym in data.columns.get_level_values(0) else None
+                    if close_series is None or close_series.dropna().empty:
+                        continue
+                    last = float(close_series.dropna().iloc[-1])
+                    if min_price <= last <= max_price:
+                        valid.append(sym)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return valid
+
+
+# ─── Core Data Functions ────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60)
 def fetch_price_data(symbol, period="3mo", interval="1d"):
@@ -185,37 +296,32 @@ def get_live_price(symbol):
         return None
 
 def compute_indicators(df):
-    """Compute all technical indicators."""
     if df is None or len(df) < 20:
         return {}
-    
+
     close = df['Close']
     high = df['High']
     low = df['Low']
     volume = df['Volume']
 
-    # RSI
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(span=14).mean()
     loss = (-delta.clip(upper=0)).ewm(span=14).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
 
-    # MACD
     ema12 = close.ewm(span=12).mean()
     ema26 = close.ewm(span=26).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9).mean()
     hist = macd - signal
 
-    # Bollinger Bands
     sma20 = close.rolling(20).mean()
     std20 = close.rolling(20).std()
     bb_upper = sma20 + 2 * std20
     bb_lower = sma20 - 2 * std20
     bb_pct = (close - bb_lower) / (bb_upper - bb_lower)
 
-    # ATR
     tr = pd.DataFrame({
         'hl': high - low,
         'hc': (high - close.shift()).abs(),
@@ -223,30 +329,24 @@ def compute_indicators(df):
     }).max(axis=1)
     atr = tr.rolling(14).mean()
 
-    # EMA stack
     ema9 = close.ewm(span=9).mean()
     ema21 = close.ewm(span=21).mean()
     ema50 = close.ewm(span=50).mean()
     ema200 = close.ewm(span=200).mean()
 
-    # Stochastic
     low14 = low.rolling(14).min()
     high14 = high.rolling(14).max()
     stoch_k = 100 * (close - low14) / (high14 - low14)
     stoch_d = stoch_k.rolling(3).mean()
 
-    # Volume MA
     vol_ma = volume.rolling(20).mean()
     vol_ratio = volume / vol_ma
 
-    # Williams %R
     williams_r = -100 * (high14 - close) / (high14 - low14)
 
-    # CCI
     tp = (high + low + close) / 3
     cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
 
-    # ADX
     plus_dm = high.diff().clip(lower=0)
     minus_dm = (-low.diff()).clip(lower=0)
     atr_14 = atr
@@ -303,10 +403,6 @@ def get_fundamentals(symbol):
         return {}
 
 def score_signal(indicators, fundamentals):
-    """
-    Multi-factor scoring engine.
-    Returns (call_score, put_score, reasoning_list)
-    """
     call_score = 0
     put_score = 0
     reasoning = []
@@ -334,7 +430,6 @@ def score_signal(indicators, fundamentals):
     ema200 = indicators.get("ema200", 0)
     atr = indicators.get("atr", 0)
 
-    # ── RSI ──
     if rsi < 30:
         call_score += 3; reasoning.append(f"RSI={rsi:.1f} — Oversold → CALL +3")
     elif rsi < 40:
@@ -346,25 +441,21 @@ def score_signal(indicators, fundamentals):
     else:
         reasoning.append(f"RSI={rsi:.1f} — Neutral")
 
-    # ── MACD ──
     if macd > macd_signal and macd_hist > 0:
         call_score += 2; reasoning.append(f"MACD bullish crossover → CALL +2")
     elif macd < macd_signal and macd_hist < 0:
         put_score += 2; reasoning.append(f"MACD bearish crossover → PUT +2")
 
-    # ── Bollinger Bands ──
     if bb_pct < 0.1:
         call_score += 2; reasoning.append(f"Price at lower BB ({bb_pct:.2f}) → CALL +2")
     elif bb_pct > 0.9:
         put_score += 2; reasoning.append(f"Price at upper BB ({bb_pct:.2f}) → PUT +2")
 
-    # ── Stochastic ──
     if stoch_k < 20 and stoch_k > stoch_d:
         call_score += 2; reasoning.append(f"Stoch K={stoch_k:.1f} oversold + crossing up → CALL +2")
     elif stoch_k > 80 and stoch_k < stoch_d:
         put_score += 2; reasoning.append(f"Stoch K={stoch_k:.1f} overbought + crossing down → PUT +2")
 
-    # ── EMA Trend ──
     if close > ema9 > ema21 > ema50:
         call_score += 3; reasoning.append(f"Strong bullish EMA stack (price > 9>21>50) → CALL +3")
     elif close < ema9 < ema21 < ema50:
@@ -374,34 +465,28 @@ def score_signal(indicators, fundamentals):
     elif close < ema50 < ema200:
         put_score += 1; reasoning.append(f"Below EMA50 & EMA200 → PUT +1")
 
-    # ── ADX + DI ──
     if adx > 25:
         if plus_di > minus_di:
             call_score += 2; reasoning.append(f"ADX={adx:.1f} strong trend, +DI>{minus_di:.1f} → CALL +2")
         else:
             put_score += 2; reasoning.append(f"ADX={adx:.1f} strong trend, -DI>{plus_di:.1f} → PUT +2")
 
-    # ── Williams %R ──
     if williams_r < -80:
         call_score += 1; reasoning.append(f"Williams R={williams_r:.1f} oversold → CALL +1")
     elif williams_r > -20:
         put_score += 1; reasoning.append(f"Williams R={williams_r:.1f} overbought → PUT +1")
 
-    # ── CCI ──
     if cci < -100:
         call_score += 1; reasoning.append(f"CCI={cci:.1f} oversold → CALL +1")
     elif cci > 100:
         put_score += 1; reasoning.append(f"CCI={cci:.1f} overbought → PUT +1")
 
-    # ── Volume ──
     if vol_ratio > 1.5:
         if call_score > put_score:
             call_score += 1; reasoning.append(f"High volume ({vol_ratio:.1f}x avg) confirms bullish → CALL +1")
         elif put_score > call_score:
             put_score += 1; reasoning.append(f"High volume ({vol_ratio:.1f}x avg) confirms bearish → PUT +1")
 
-    # ── Fundamentals ──
-    beta = fundamentals.get("beta", 1)
     pe = fundamentals.get("pe", None)
     if pe and pe < 15:
         call_score += 1; reasoning.append(f"Low P/E ({pe:.1f}) → fundamentally cheap → CALL +1")
@@ -411,7 +496,6 @@ def score_signal(indicators, fundamentals):
     return call_score, put_score, reasoning
 
 def get_recommendation(symbol):
-    """Full recommendation with target."""
     df = fetch_price_data(symbol, period="3mo", interval="1d")
     indicators = compute_indicators(df)
     fundamentals = get_fundamentals(symbol)
@@ -449,7 +533,7 @@ def get_recommendation(symbol):
         "reasoning": reasoning,
     }
 
-# ─── Black-Scholes for option premium estimation ───────────────────────────────
+# ─── Black-Scholes ──────────────────────────────────────────────────────────────
 def bs_price(S, K, T, r, sigma, option_type="call"):
     if T <= 0 or sigma <= 0:
         return max(0, S - K) if option_type == "call" else max(0, K - S)
@@ -466,60 +550,113 @@ def estimate_iv(df):
     returns = df['Close'].pct_change().dropna()
     return float(returns.std() * np.sqrt(252))
 
-def get_nearby_strikes(price, n=5, step_pct=0.01):
-    step = max(50, round(price * step_pct / 50) * 50)
-    atm = round(price / step) * step
-    return [atm + step * i for i in range(-n, n+1)]
+# ─── Parallel signal scan ──────────────────────────────────────────────────────
 
-# ─── Auto Trading Engine ────────────────────────────────────────────────────────
-def auto_trade_step(symbols, capital_per_trade=5000):
-    """Execute one auto-trade cycle. Returns list of new trades."""
+def _scan_single(symbol):
+    """Thread-safe wrapper for one symbol scan."""
+    try:
+        return get_recommendation(symbol)
+    except Exception:
+        return None
+
+
+def scan_symbols_parallel(symbols, max_workers=20):
+    """
+    Scan a large list of symbols in parallel.
+    Returns list of recommendation dicts, sorted by strength descending.
+    """
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_scan_single, sym): sym for sym in symbols}
+        for future in concurrent.futures.as_completed(future_map):
+            res = future.result()
+            if res and res["price"] and res["price"] > 0:
+                results.append(res)
+    # Sort: non-neutral first, then by strength
+    results.sort(key=lambda x: (0 if x["recommendation"] == "NEUTRAL" else 1, x["strength"]), reverse=True)
+    return results
+
+
+# ─── Multi-Option Auto Trading Engine ─────────────────────────────────────────
+
+def build_trade_from_rec(rec, capital_per_trade):
+    """
+    Build a trade dict from a recommendation.
+    Returns None if not actionable.
+    """
+    if rec["recommendation"] == "NEUTRAL" or rec["strength"] < 60:
+        return None
+    price = rec["price"]
+    if not price or price == 0:
+        return None
+
+    opt_type = rec["recommendation"]
+    strike = round(price / 50) * 50
+    expiry_days = 7
+    T = expiry_days / 365
+    sigma = estimate_iv(fetch_price_data(rec["symbol"], "1mo", "1d"))
+    premium = bs_price(price, strike, T, 0.065, sigma, opt_type.lower())
+    if premium <= 0:
+        premium = price * 0.01
+    lots = max(1, int(capital_per_trade / (premium * 50)))
+
+    return {
+        "id": f"{rec['symbol']}_{opt_type}_{int(time.time()*1000)}",
+        "symbol": rec["symbol"],
+        "type": opt_type,
+        "strike": strike,
+        "entry_price": price,
+        "premium": round(premium, 2),
+        "lots": lots,
+        "qty": lots * 50,
+        "target": rec["target"],
+        "stop": rec["stop"],
+        "entry_time": datetime.now().strftime("%H:%M:%S"),
+        "status": "OPEN",
+        "pnl": 0.0,
+        "reasoning": rec["reasoning"],
+        "indicators": rec["indicators"],
+        "strength": rec["strength"],
+        "call_score": rec.get("call_score", 0),
+        "put_score": rec.get("put_score", 0),
+    }
+
+
+def auto_trade_step_multi(all_symbols, capital_per_trade, max_open_positions, min_strength):
+    """
+    Scan ALL symbols in parallel, pick top signals, build trades for each.
+    Returns list of new trade dicts (one per qualifying symbol, up to max_open_positions).
+    Already-open positions are excluded by caller.
+    """
+    # Work on a reasonably large slice — the full list can be scanned in parallel
+    scan_limit = min(len(all_symbols), 300)   # top 300 by market cap ordering in list
+    symbols_to_scan = all_symbols[:scan_limit]
+
+    recommendations = scan_symbols_parallel(symbols_to_scan, max_workers=30)
+
     new_trades = []
-    for symbol in symbols[:5]:  # limit to 5 per cycle
-        try:
-            rec = get_recommendation(symbol)
-            if rec["recommendation"] == "NEUTRAL":
-                continue
-            if rec["strength"] < 60:
-                continue
+    existing_keys = {p["symbol"] + p["type"] for p in st.session_state.portfolio}
 
-            price = rec["price"]
-            if not price or price == 0:
-                continue
-
-            opt_type = rec["recommendation"]
-            strike = round(price / 50) * 50
-            expiry_days = 7
-            T = expiry_days / 365
-            sigma = estimate_iv(fetch_price_data(symbol, "1mo", "1d"))
-            premium = bs_price(price, strike, T, 0.065, sigma, opt_type.lower())
-            lots = max(1, int(capital_per_trade / (premium * 50)))
-
-            trade = {
-                "id": f"{symbol}_{opt_type}_{int(time.time())}",
-                "symbol": symbol,
-                "type": opt_type,
-                "strike": strike,
-                "entry_price": price,
-                "premium": round(premium, 2),
-                "lots": lots,
-                "qty": lots * 50,
-                "target": rec["target"],
-                "stop": rec["stop"],
-                "entry_time": datetime.now().strftime("%H:%M:%S"),
-                "status": "OPEN",
-                "pnl": 0.0,
-                "reasoning": rec["reasoning"],
-                "indicators": rec["indicators"],
-                "strength": rec["strength"],
-            }
-            new_trades.append(trade)
-        except Exception:
+    for rec in recommendations:
+        if len(st.session_state.portfolio) + len(new_trades) >= max_open_positions:
+            break
+        if rec["recommendation"] == "NEUTRAL":
             continue
+        if rec["strength"] < min_strength:
+            continue
+        key = rec["symbol"] + rec["recommendation"]
+        if key in existing_keys:
+            continue
+
+        trade = build_trade_from_rec(rec, capital_per_trade)
+        if trade:
+            new_trades.append(trade)
+            existing_keys.add(key)   # prevent duplicates within this batch
+
     return new_trades
 
+
 def square_off_positions(log_entries):
-    """Close all open positions and return P&L + log."""
     closed = []
     total_pnl = 0
     for pos in st.session_state.portfolio:
@@ -528,19 +665,18 @@ def square_off_positions(log_entries):
             pnl = (price - pos["entry_price"]) * pos["qty"]
         else:
             pnl = (pos["entry_price"] - price) * pos["qty"]
-        
         pos_closed = {**pos, "exit_price": price, "exit_time": datetime.now().strftime("%H:%M:%S"),
                       "pnl": round(pnl, 2), "status": "CLOSED"}
         closed.append(pos_closed)
         total_pnl += pnl
-    
+
     st.session_state.history.extend(closed)
     st.session_state.portfolio = []
     st.session_state.used_capital = 0.0
     return closed, total_pnl
 
+
 def generate_trade_report(closed_trades, total_pnl, duration_mins):
-    """Generate a downloadable text report."""
     lines = []
     lines.append("=" * 70)
     lines.append("         OPTIONS TRADER PRO — AUTO TRADING REPORT")
@@ -552,7 +688,7 @@ def generate_trade_report(closed_trades, total_pnl, duration_mins):
     lines.append("")
 
     for i, t in enumerate(closed_trades, 1):
-        lines.append(f"─" * 70)
+        lines.append("─" * 70)
         lines.append(f"Trade #{i}  |  {t['symbol']}  |  {t['type']}")
         lines.append(f"  Strike     : ₹{t['strike']}")
         lines.append(f"  Entry Time : {t.get('entry_time', 'N/A')}")
@@ -571,10 +707,10 @@ def generate_trade_report(closed_trades, total_pnl, duration_mins):
         inds = t.get("indicators", {})
         if inds:
             lines.append("  KEY INDICATORS AT ENTRY:")
-            lines.append(f"    RSI       : {inds.get('rsi', 'N/A'):.1f}" if inds.get('rsi') else "    RSI: N/A")
-            lines.append(f"    MACD      : {inds.get('macd', 'N/A'):.4f}" if inds.get('macd') else "")
-            lines.append(f"    BB %      : {inds.get('bb_pct', 'N/A'):.2f}" if inds.get('bb_pct') else "")
-            lines.append(f"    ADX       : {inds.get('adx', 'N/A'):.1f}" if inds.get('adx') else "")
+            if inds.get('rsi'): lines.append(f"    RSI       : {inds['rsi']:.1f}")
+            if inds.get('macd'): lines.append(f"    MACD      : {inds['macd']:.4f}")
+            if inds.get('bb_pct'): lines.append(f"    BB %      : {inds['bb_pct']:.2f}")
+            if inds.get('adx'): lines.append(f"    ADX       : {inds['adx']:.1f}")
             lines.append(f"    Stoch K/D : {inds.get('stoch_k', 0):.1f} / {inds.get('stoch_d', 0):.1f}")
             lines.append(f"    Vol Ratio : {inds.get('vol_ratio', 1):.2f}x")
         lines.append("")
@@ -591,7 +727,7 @@ st.markdown("""
 <h1 style='font-family:Syne;font-weight:800;font-size:2.2rem;background:linear-gradient(90deg,#00d4ff,#00ff88);
 -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px;'>
 ⚡ Options Trader Pro</h1>
-<p style='color:#64748b;font-size:0.85rem;margin-top:0;'>AI-Powered Call & Put Intelligence · Indian Markets</p>
+<p style='color:#64748b;font-size:0.85rem;margin-top:0;'>AI-Powered Call & Put Intelligence · Full NSE Universe</p>
 """, unsafe_allow_html=True)
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -600,15 +736,36 @@ with st.sidebar:
     starting_capital = st.number_input("💰 Capital (₹)", value=100000, step=10000)
     st.session_state.capital = float(starting_capital)
     capital_per_trade = st.number_input("Per-Trade Capital (₹)", value=5000, step=1000)
-    
+
     st.markdown("---")
-    st.markdown("### 📡 Market Universe")
-    selected_stocks = st.multiselect(
-        "Stocks to Monitor",
-        INDIAN_STOCKS,
-        default=["RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS"]
+    st.markdown("### 🌐 NSE Universe")
+
+    if st.button("🔄 Refresh NSE Symbol List", use_container_width=True):
+        fetch_nse_all_symbols.clear()   # bust the cache
+        st.session_state.nse_symbols = []
+
+    all_nse = get_nse_symbols()
+    st.markdown(f'<div class="scan-info">📡 <b>{len(all_nse):,}</b> NSE symbols loaded</div>', unsafe_allow_html=True)
+
+    # Optional: let user narrow scan universe manually (leave blank = scan all)
+    st.markdown("**Optional: Pin specific symbols**")
+    pinned_symbols = st.multiselect(
+        "Always include in scan",
+        options=all_nse[:500],   # show top 500 in dropdown for usability
+        default=[]
     )
-    
+
+    # Scan scope slider
+    scan_top_n = st.slider(
+        "Scan top N symbols (by list order)",
+        min_value=20, max_value=min(500, len(all_nse)),
+        value=100, step=10,
+        help="Larger = more opportunities found but slower. 100 is a good balance."
+    )
+
+    min_signal_strength = st.slider("Min Signal Strength for Auto Trade", 50, 90, 65, 5)
+    max_open_positions = st.slider("Max Simultaneous Open Positions", 1, 30, 10, 1)
+
     st.markdown("---")
     st.markdown("### 📊 Portfolio Summary")
     open_pos = len(st.session_state.portfolio)
@@ -617,6 +774,11 @@ with st.sidebar:
     st.metric("Closed Trades", len(st.session_state.history))
     st.metric("Realized P&L", f"₹{total_hist_pnl:,.2f}", delta=f"{'↑' if total_hist_pnl >= 0 else '↓'}")
 
+# Build the effective scan universe (pinned + top N from full list)
+effective_scan_universe = list(dict.fromkeys(
+    pinned_symbols + [s for s in all_nse if s not in pinned_symbols]
+))[:scan_top_n + len(pinned_symbols)]
+
 # ── Main Tabs ──────────────────────────────────────────────────────────────────
 tabs = st.tabs(["🔍 Signal Scanner", "⚡ Auto Trading", "📋 Watchlist", "💼 Portfolio", "📜 History"])
 
@@ -624,26 +786,30 @@ tabs = st.tabs(["🔍 Signal Scanner", "⚡ Auto Trading", "📋 Watchlist", "�
 # TAB 1 — Signal Scanner
 # ─────────────────────────────────────────────────────────────────────────────
 with tabs[0]:
-    st.markdown('<div class="section-title">📡 Live Option Signal Scanner</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📡 Live Option Signal Scanner — Full NSE</div>', unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <div class="scan-info">
+    🌐 Scanning from <b>{len(effective_scan_universe)}</b> NSE symbols dynamically fetched from NSE's equity list.
+    Adjust <b>Scan top N</b> in the sidebar to widen or narrow the universe.
+    </div>
+    """, unsafe_allow_html=True)
 
     col_scan, col_sym = st.columns([1, 3])
     with col_scan:
-        scan_btn = st.button("🔄 Scan All Stocks", use_container_width=True)
+        scan_btn = st.button("🔄 Scan NSE Universe", use_container_width=True)
     with col_sym:
-        single_sym = st.selectbox("Quick Analyse", [""] + INDIAN_STOCKS)
+        single_sym = st.selectbox("Quick Analyse Single Symbol", [""] + effective_scan_universe)
 
     if scan_btn or (single_sym and single_sym != ""):
-        symbols = [single_sym] if single_sym else selected_stocks
+        symbols = [single_sym] if (single_sym and single_sym != "") else effective_scan_universe
         results = []
-        with st.spinner("Analysing signals…"):
-            prog = st.progress(0)
-            for i, sym in enumerate(symbols):
-                rec = get_recommendation(sym)
-                results.append(rec)
-                prog.progress((i + 1) / len(symbols))
-        prog.empty()
+        with st.spinner(f"Parallel-scanning {len(symbols)} symbols…"):
+            prog_bar = st.progress(0)
+            results = scan_symbols_parallel(symbols, max_workers=30)
+            prog_bar.progress(1.0)
+        prog_bar.empty()
 
-        # Summary metrics
         calls = [r for r in results if r["recommendation"] == "CALL"]
         puts = [r for r in results if r["recommendation"] == "PUT"]
         neutrals = [r for r in results if r["recommendation"] == "NEUTRAL"]
@@ -660,11 +826,13 @@ with tabs[0]:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        for rec in results:
-            badge_cls = "badge-call" if rec["recommendation"] == "CALL" else ("badge-put" if rec["recommendation"] == "PUT" else "badge-neutral")
-            color = "green" if rec["recommendation"] == "CALL" else ("red" if rec["recommendation"] == "PUT" else "yellow")
+        # Show non-neutral first, then neutral
+        sorted_results = [r for r in results if r["recommendation"] != "NEUTRAL"] + \
+                         [r for r in results if r["recommendation"] == "NEUTRAL"]
 
-            with st.expander(f"{'🟢' if rec['recommendation']=='CALL' else '🔴' if rec['recommendation']=='PUT' else '🟡'} {rec['symbol']} | ₹{rec['price']:,.2f} | {rec['recommendation']} | Strength {rec['strength']}%"):
+        for rec in sorted_results:
+            icon = '🟢' if rec['recommendation'] == 'CALL' else ('🔴' if rec['recommendation'] == 'PUT' else '🟡')
+            with st.expander(f"{icon} {rec['symbol']} | ₹{rec['price']:,.2f} | {rec['recommendation']} | Strength {rec['strength']}%"):
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("LTP", f"₹{rec['price']:,.2f}")
                 c2.metric("Signal", rec["recommendation"])
@@ -697,7 +865,6 @@ with tabs[0]:
                         fc3.metric("EPS", f"{fund.get('eps','N/A')}")
                         fc4.metric("P/B", f"{fund.get('pb','N/A')}")
 
-                # Add to watchlist / manual buy
                 bc1, bc2 = st.columns(2)
                 with bc1:
                     if st.button(f"➕ Add to Watchlist", key=f"wl_{rec['symbol']}"):
@@ -714,57 +881,46 @@ with tabs[0]:
                 with bc2:
                     if rec["recommendation"] != "NEUTRAL":
                         if st.button(f"🚀 Buy {rec['recommendation']}", key=f"buy_{rec['symbol']}"):
-                            price = rec["price"]
-                            df_tmp = fetch_price_data(rec["symbol"], "1mo", "1d")
-                            sigma = estimate_iv(df_tmp)
-                            strike = round(price / 50) * 50
-                            premium = bs_price(price, strike, 7/365, 0.065, sigma, rec["recommendation"].lower())
-                            trade = {
-                                "id": f"{rec['symbol']}_{rec['recommendation']}_{int(time.time())}",
-                                "symbol": rec["symbol"],
-                                "type": rec["recommendation"],
-                                "strike": strike,
-                                "entry_price": price,
-                                "premium": round(premium, 2),
-                                "lots": 1,
-                                "qty": 50,
-                                "target": rec["target"],
-                                "stop": rec["stop"],
-                                "entry_time": datetime.now().strftime("%H:%M:%S"),
-                                "status": "OPEN",
-                                "pnl": 0.0,
-                                "reasoning": rec["reasoning"],
-                                "indicators": rec["indicators"],
-                                "strength": rec["strength"],
-                            }
-                            st.session_state.portfolio.append(trade)
-                            st.success(f"✅ Bought {rec['recommendation']} on {rec['symbol']}!")
-
+                            trade = build_trade_from_rec(rec, capital_per_trade)
+                            if trade:
+                                st.session_state.portfolio.append(trade)
+                                st.success(f"✅ Bought {rec['recommendation']} on {rec['symbol']}!")
     else:
-        st.info("👆 Click **Scan All Stocks** or select a symbol above to begin analysis.")
+        st.info("👆 Click **Scan NSE Universe** or select a symbol above to begin analysis.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 2 — Auto Trading
 # ─────────────────────────────────────────────────────────────────────────────
 with tabs[1]:
-    st.markdown('<div class="section-title">⚡ AI Auto Trading Engine</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">⚡ AI Multi-Option Auto Trading Engine</div>', unsafe_allow_html=True)
 
-    st.markdown("""
+    st.markdown(f"""
     <div class="auto-trade-box">
-    <h2 style='color:#00d4ff;font-family:Syne;font-weight:800;'>🤖 Autonomous Options AI</h2>
-    <p style='color:#94a3b8;'>The engine scans all stocks every 60 seconds, picks the highest-confidence CALL/PUT signals,
-    executes trades, manages positions, and squares off everything when time is up.</p>
+    <h2 style='color:#00d4ff;font-family:Syne;font-weight:800;'>🤖 Autonomous Multi-Position Options AI</h2>
+    <p style='color:#94a3b8;'>
+    The engine scans <b>the full NSE universe</b> ({len(effective_scan_universe)} symbols) every cycle in parallel,
+    identifies <b>all</b> high-confidence CALL/PUT signals simultaneously, opens <b>multiple positions at once</b>
+    (up to your configured limit), manages live P&L, auto-exits on target/stop, and squares off everything at session end.
+    </p>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     if not st.session_state.auto_trading:
-        col_t1, col_t2, col_t3 = st.columns([1, 1, 1])
+        col_t1, col_t2, col_t3 = st.columns([1, 2, 1])
         with col_t2:
             auto_mins = st.number_input("⏱️ Duration (minutes)", min_value=1, max_value=480, value=15, step=5)
             auto_capital = st.number_input("💰 Capital per trade (₹)", min_value=1000, value=5000, step=1000)
-            
+            auto_max_pos = st.number_input("📊 Max simultaneous positions", min_value=1, max_value=50, value=max_open_positions, step=1)
+            auto_min_str = st.number_input("🎯 Min signal strength (%)", min_value=50, max_value=95, value=min_signal_strength, step=5)
+
+            st.markdown(f"""
+            <div class="scan-info">
+            🔭 Will scan <b>{len(effective_scan_universe)}</b> symbols per cycle · Open up to <b>{int(auto_max_pos)}</b> positions · Min strength <b>{int(auto_min_str)}%</b>
+            </div>
+            """, unsafe_allow_html=True)
+
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("🚀 START AUTO TRADING", use_container_width=True):
                 st.session_state.auto_trading = True
@@ -773,6 +929,8 @@ with tabs[1]:
                 st.session_state.auto_pnl = 0.0
                 st.session_state._auto_duration = auto_mins
                 st.session_state._auto_capital = auto_capital
+                st.session_state._auto_max_pos = int(auto_max_pos)
+                st.session_state._auto_min_str = int(auto_min_str)
                 st.rerun()
     else:
         end_time = st.session_state.auto_trade_end
@@ -780,76 +938,79 @@ with tabs[1]:
         elapsed = st.session_state._auto_duration * 60 - remaining
         progress = elapsed / (st.session_state._auto_duration * 60)
 
-        # Status bar
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         mins_left = int(remaining // 60)
         secs_left = int(remaining % 60)
         c1.metric("⏱ Time Left", f"{mins_left}m {secs_left}s")
-        c2.metric("Open Trades", len(st.session_state.portfolio))
+        c2.metric("Open Positions", len(st.session_state.portfolio))
         live_pnl = sum(t.get("pnl", 0) for t in st.session_state.portfolio)
         c3.metric("Live P&L", f"₹{live_pnl:,.2f}", delta="▲" if live_pnl >= 0 else "▼")
         c4.metric("Realized P&L", f"₹{sum(t.get('pnl',0) for t in st.session_state.history):,.2f}")
+        c5.metric("Total Trades", len(st.session_state.auto_trade_log))
 
         st.progress(min(progress, 1.0))
 
         if remaining <= 0:
-            # Square off
             st.warning("⏰ Time up! Squaring off all positions…")
             closed_trades, total_pnl = square_off_positions(st.session_state.auto_trade_log)
-            report = generate_trade_report(
-                closed_trades, total_pnl, st.session_state._auto_duration
-            )
+            report = generate_trade_report(closed_trades, total_pnl, st.session_state._auto_duration)
             st.session_state.auto_trading = False
             st.session_state._last_report = report
             st.session_state._last_pnl = total_pnl
             st.rerun()
         else:
-            # Execute a cycle
-            if len(st.session_state.portfolio) < 10:
-                new_trades = auto_trade_step(
-                    selected_stocks,
-                    st.session_state.get("_auto_capital", 5000)
-                )
+            _max_pos = st.session_state.get("_auto_max_pos", 10)
+            _min_str = st.session_state.get("_auto_min_str", 65)
+            _capital = st.session_state.get("_auto_capital", 5000)
+
+            if len(st.session_state.portfolio) < _max_pos:
+                with st.spinner(f"🔭 Scanning {len(effective_scan_universe)} NSE symbols for new signals…"):
+                    new_trades = auto_trade_step_multi(
+                        effective_scan_universe,
+                        capital_per_trade=_capital,
+                        max_open_positions=_max_pos,
+                        min_strength=_min_str,
+                    )
                 for t in new_trades:
-                    # Check not already in portfolio
-                    existing = [p["symbol"] + p["type"] for p in st.session_state.portfolio]
+                    existing = {p["symbol"] + p["type"] for p in st.session_state.portfolio}
                     if t["symbol"] + t["type"] not in existing:
                         st.session_state.portfolio.append(t)
                         st.session_state.auto_trade_log.append(t)
 
-            # Update live PnL on open positions
+            # Update live PnL and auto-exit hits
+            still_open = []
             for pos in st.session_state.portfolio:
                 price = get_live_price(pos["symbol"]) or pos["entry_price"]
                 if pos["type"] == "CALL":
                     pos["pnl"] = round((price - pos["entry_price"]) * pos["qty"], 2)
-                    # auto stop / target
-                    if price >= pos["target"] or price <= pos["stop"]:
-                        hist_entry = {**pos, "exit_price": price,
-                                      "exit_time": datetime.now().strftime("%H:%M:%S"), "status": "CLOSED"}
-                        st.session_state.history.append(hist_entry)
-                        st.session_state.portfolio = [p for p in st.session_state.portfolio if p["id"] != pos["id"]]
+                    hit_exit = price >= pos["target"] or price <= pos["stop"]
                 else:
                     pos["pnl"] = round((pos["entry_price"] - price) * pos["qty"], 2)
-                    if price <= pos["target"] or price >= pos["stop"]:
-                        hist_entry = {**pos, "exit_price": price,
-                                      "exit_time": datetime.now().strftime("%H:%M:%S"), "status": "CLOSED"}
-                        st.session_state.history.append(hist_entry)
-                        st.session_state.portfolio = [p for p in st.session_state.portfolio if p["id"] != pos["id"]]
+                    hit_exit = price <= pos["target"] or price >= pos["stop"]
 
-            # Show open positions
+                if hit_exit:
+                    hist_entry = {**pos, "exit_price": price,
+                                  "exit_time": datetime.now().strftime("%H:%M:%S"),
+                                  "status": "CLOSED"}
+                    st.session_state.history.append(hist_entry)
+                else:
+                    still_open.append(pos)
+
+            st.session_state.portfolio = still_open
+
+            # Show open positions table
             st.markdown("### 📊 Live Positions")
             if st.session_state.portfolio:
-                df_pos = pd.DataFrame(st.session_state.portfolio)[
-                    ["symbol","type","strike","entry_price","lots","qty","target","stop","pnl","strength"]
-                ]
-                st.dataframe(df_pos, use_container_width=True)
+                df_pos = pd.DataFrame(st.session_state.portfolio)
+                display_cols = [c for c in ["symbol","type","strike","entry_price","lots","qty","target","stop","pnl","strength"] if c in df_pos.columns]
+                st.dataframe(df_pos[display_cols], use_container_width=True)
             else:
-                st.info("Scanning for signals…")
+                st.info("No open positions. Scanning for signals on next cycle…")
 
-            # Trade log
-            st.markdown("### 📋 Auto Trade Log")
+            # Trade log (last 20)
+            st.markdown("### 📋 Auto Trade Log (most recent)")
             if st.session_state.auto_trade_log:
-                for t in reversed(st.session_state.auto_trade_log[-10:]):
+                for t in reversed(st.session_state.auto_trade_log[-20:]):
                     badge = "🟢 CALL" if t["type"] == "CALL" else "🔴 PUT"
                     st.markdown(f"- {badge} **{t['symbol']}** | Strike ₹{t['strike']} | Strength {t['strength']}% | Entry ₹{t['entry_price']:.2f}")
 
@@ -858,9 +1019,7 @@ with tabs[1]:
                 st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
                 if st.button("🛑 STOP & SQUARE OFF", use_container_width=True):
                     closed_trades, total_pnl = square_off_positions(st.session_state.auto_trade_log)
-                    report = generate_trade_report(
-                        closed_trades, total_pnl, st.session_state._auto_duration
-                    )
+                    report = generate_trade_report(closed_trades, total_pnl, st.session_state._auto_duration)
                     st.session_state.auto_trading = False
                     st.session_state._last_report = report
                     st.session_state._last_pnl = total_pnl
@@ -870,7 +1029,6 @@ with tabs[1]:
             time.sleep(10)
             st.rerun()
 
-    # Report download (after session ends)
     if not st.session_state.auto_trading and "_last_report" in st.session_state:
         pnl = st.session_state._last_pnl
         color = "green" if pnl >= 0 else "red"
@@ -889,10 +1047,9 @@ with tabs[1]:
 with tabs[2]:
     st.markdown('<div class="section-title">👁️ Options Watchlist</div>', unsafe_allow_html=True)
 
-    # Add to watchlist manually
     with st.expander("➕ Add Option to Watchlist"):
         wc1, wc2, wc3, wc4, wc5 = st.columns(5)
-        w_sym = wc1.selectbox("Symbol", INDIAN_STOCKS, key="w_sym")
+        w_sym = wc1.selectbox("Symbol", effective_scan_universe[:500], key="w_sym")
         w_type = wc2.selectbox("Type", ["CALL", "PUT"], key="w_type")
         w_strike = wc3.number_input("Strike (₹)", min_value=0.0, value=0.0, key="w_strike")
         w_target = wc4.number_input("Target (₹)", min_value=0.0, value=0.0, key="w_target")
@@ -962,7 +1119,6 @@ with tabs[3]:
 
         for pos in st.session_state.portfolio:
             badge = "🟢 CALL" if pos["type"] == "CALL" else "🔴 PUT"
-            pnl_cls = "green" if pos["pnl"] >= 0 else "red"
             with st.expander(f"{badge} {pos['symbol']} | Strike ₹{pos['strike']} | P&L: ₹{pos['pnl']:,.2f}"):
                 pc1, pc2, pc3, pc4, pc5 = st.columns(5)
                 pc1.metric("Entry", f"₹{pos['entry_price']:.2f}")
@@ -985,7 +1141,6 @@ with tabs[3]:
                     st.success(f"Squared off {pos['symbol']} {pos['type']} | P&L: ₹{final_pnl:,.2f}")
                     st.rerun()
 
-        # PnL chart
         if len(st.session_state.history) >= 2:
             hist_df = pd.DataFrame(st.session_state.history)
             hist_df["cumulative"] = hist_df["pnl"].cumsum()
@@ -1026,7 +1181,6 @@ with tabs[4]:
         hc3.metric("Losers", losses)
         hc4.metric("Net P&L", f"₹{total_pnl:,.2f}")
 
-        # Download history
         csv = hist_df.to_csv(index=False)
         st.download_button("📥 Download History CSV", data=csv,
                            file_name=f"trade_history_{datetime.now().strftime('%Y%m%d')}.csv",
