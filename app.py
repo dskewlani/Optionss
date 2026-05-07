@@ -276,6 +276,9 @@ def init_state():
 
 init_state()
 
+# ─── Volume Filter Constant ───────────────────────────────────────────────────
+MIN_VOLUME_THRESHOLD = 10_000_000  # 1 crore shares — only liquid, high-volume stocks
+
 # ─── NSE Symbol Fetching ──────────────────────────────────────────────────────
 FALLBACK_NSE_SYMBOLS = [
     "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS","SBIN.NS",
@@ -359,6 +362,42 @@ def _safe_float(series_or_val, default=0.0):
         return val if np.isfinite(val) else default
     except Exception:
         return default
+
+# ─── Volume Filter ────────────────────────────────────────────────────────────
+def passes_volume_filter(df, threshold=MIN_VOLUME_THRESHOLD):
+    """
+    Returns True only if the stock's average daily volume over the last 20 days
+    is >= MIN_VOLUME_THRESHOLD (10,000,000 shares).
+    Index symbols (^NSEI etc.) are exempt from this filter.
+    """
+    try:
+        if df is None or df.empty:
+            return False
+        volume_series = df["Volume"].astype(float)
+        avg_volume = volume_series.tail(20).mean()
+        return float(avg_volume) >= threshold
+    except Exception:
+        return False
+
+def passes_volume_filter_by_symbol(symbol, threshold=MIN_VOLUME_THRESHOLD):
+    """
+    Quick volume check using fast_info.three_month_average_volume from yfinance.
+    Falls back to fetching daily data if fast_info is unavailable.
+    Index symbols are exempt.
+    """
+    # Exempt index symbols — they don't have meaningful volume in the same sense
+    if symbol.startswith("^"):
+        return True
+    try:
+        t = yf.Ticker(symbol)
+        avg_vol = t.fast_info.three_month_average_volume
+        if avg_vol is not None and np.isfinite(float(avg_vol)):
+            return float(avg_vol) >= threshold
+    except Exception:
+        pass
+    # Fallback: use last 20 days of daily data
+    df = fetch_price_data(symbol, period="1mo", interval="1d")
+    return passes_volume_filter(df, threshold)
 
 # ─── Market Context Functions ─────────────────────────────────────────────────
 @st.cache_data(ttl=300)
@@ -722,6 +761,9 @@ def compute_indicators(df):
         prev_close      = close.shift(1)
         day_change_pct  = ((close - prev_close) / prev_close.replace(0, np.nan)) * 100
 
+        # Average volume (last 20 days) — stored for display purposes
+        avg_volume_20d = float(volume.tail(20).mean()) if len(volume) >= 20 else float(volume.mean())
+
         return {
             "rsi":            _safe_float(rsi),
             "rsi_series":     rsi,           # keep series for divergence
@@ -750,6 +792,7 @@ def compute_indicators(df):
             "day_change_pct": _safe_float(day_change_pct),
             "prev_close":     _safe_float(prev_close),
             "volume":         _safe_float(volume),
+            "avg_volume_20d": avg_volume_20d,
             "momentum_1m":    momentum_1m,
             "momentum_3m":    momentum_3m,
         }
@@ -832,18 +875,6 @@ def should_skip_earnings(fundamentals):
 def score_signal(indicators, fundamentals, df=None, market_mood=None,
                  top_sectors=None, use_multi_tf=False, symbol=None,
                  market_mode=None):
-    """
-    Enhanced signal scoring with:
-    - Market context filter (Nifty mood, VIX)
-    - Candlestick patterns
-    - RSI divergence
-    - Support/Resistance distance
-    - Fibonacci levels
-    - Market mode (trending vs ranging)
-    - Sector filter
-    - Earnings avoidance
-    - Momentum ranking bonus
-    """
     buy_score  = 0
     sell_score = 0
     reasoning  = []
@@ -1079,6 +1110,43 @@ def get_recommendation(symbol, market_mood=None, top_sectors=None, use_multi_tf=
     fundamentals = get_fundamentals(symbol)
     market_mode  = detect_market_mode(indicators) if indicators else "RANGING"
 
+    # ── VOLUME FILTER ─────────────────────────────────────────────────────────
+    # Skip index symbols (^NSEI etc.); for equities, enforce 10M avg volume
+    if not symbol.startswith("^"):
+        avg_vol = indicators.get("avg_volume_20d", 0) if indicators else 0
+        if avg_vol < MIN_VOLUME_THRESHOLD:
+            # Return a NEUTRAL result with a note so it can be filtered out upstream
+            return {
+                "symbol":         symbol,
+                "cmp":            0,
+                "price":          0,
+                "recommendation": "NEUTRAL",
+                "strength":       0,
+                "target":         0,
+                "stop":           0,
+                "buy_score":      0,
+                "sell_score":     0,
+                "day_change":     0.0,
+                "vol_ratio":      0.0,
+                "momentum_1m":    0.0,
+                "momentum_3m":    0.0,
+                "indicators":     {},
+                "fundamentals":   fundamentals,
+                "reasoning":      [f"⛔ Avg volume {avg_vol:,.0f} < 10,000,000 — skipped (low liquidity)"],
+                "name":           fundamentals.get("name", symbol),
+                "sector":         fundamentals.get("sector", "N/A"),
+                "patterns":       [],
+                "divergence":     None,
+                "support":        None,
+                "resistance":     None,
+                "fibs":           {},
+                "market_mode":    market_mode,
+                "rr_ratio":       1.0,
+                "atr":            0.0,
+                "volume_skipped": True,   # flag for upstream filtering
+            }
+    # ── END VOLUME FILTER ─────────────────────────────────────────────────────
+
     buy_score, sell_score, reasoning, composite = score_signal(
         indicators, fundamentals, df=df,
         market_mood=market_mood, top_sectors=top_sectors,
@@ -1159,6 +1227,7 @@ def get_recommendation(symbol, market_mood=None, top_sectors=None, use_multi_tf=
         "market_mode":    market_mode,
         "rr_ratio":       rr_ratio,
         "atr":            atr,
+        "volume_skipped": False,
     }
 
 
@@ -1178,6 +1247,9 @@ def scan_symbols_parallel(symbols, max_workers=30, market_mood=None, top_sectors
         for future in concurrent.futures.as_completed(future_map):
             try:
                 res = future.result()
+                # ── VOLUME FILTER: drop low-liquidity stocks from scan results ──
+                if res and res.get("volume_skipped", False):
+                    continue   # silently exclude — don't show in scanner results
                 if res and res.get("price") and res["price"] > 0:
                     results.append(res)
             except Exception:
@@ -1197,6 +1269,9 @@ def build_trade_from_rec(rec, base_capital, win_rate=0.55, use_kelly=True):
     if rec.get("recommendation") == "NEUTRAL":
         return None
     if rec.get("strength", 0) < 60:
+        return None
+    # ── VOLUME GUARD: never trade a volume-skipped stock ──────────────────────
+    if rec.get("volume_skipped", False):
         return None
 
     price = rec.get("price") or 0
@@ -1328,6 +1403,13 @@ def auto_trade_step_multi(all_symbols, capital_per_trade, max_open_positions,
     scan_limit      = min(len(all_symbols), 500)
     symbols_to_scan = all_symbols[:scan_limit]
 
+    # ── VOLUME PRE-FILTER ─────────────────────────────────────────────────────
+    # scan_symbols_parallel already drops volume_skipped results, but we add a
+    # note here for clarity: the filter is enforced inside get_recommendation()
+    # and again in the results loop of scan_symbols_parallel.
+    # No extra work needed — the pipeline handles it end-to-end.
+    # ── END VOLUME PRE-FILTER ─────────────────────────────────────────────────
+
     recommendations = scan_symbols_parallel(
         symbols_to_scan, max_workers=30,
         market_mood=market_mood, top_sectors=top_sectors,
@@ -1349,6 +1431,9 @@ def auto_trade_step_multi(all_symbols, capital_per_trade, max_open_positions,
             continue
         if rec.get("strength", 0) < min_strength:
             break
+        # ── Extra volume guard at trade-entry level ───────────────────────────
+        if rec.get("volume_skipped", False):
+            continue
 
         # VIX guard
         if vix > 25:
@@ -1443,6 +1528,7 @@ def generate_trade_report(closed_trades, total_pnl, duration_mins):
         f"Gross P&L   : ₹{gross_pnl:,.2f}",
         f"Brokerage   : ₹{total_brokerage:,.2f}",
         f"Net P&L     : ₹{total_pnl:,.2f}",
+        f"Volume Filter: Avg 20D Vol ≥ 10,000,000 shares enforced",
         "",
     ]
     for i, t in enumerate(closed_trades, 1):
@@ -1476,6 +1562,7 @@ def generate_trade_report(closed_trades, total_pnl, duration_mins):
             if inds.get('adx'):    lines.append(f"    ADX       : {inds['adx']:.1f}")
             lines.append(f"    Stoch K/D : {inds.get('stoch_k',0):.1f} / {inds.get('stoch_d',0):.1f}")
             lines.append(f"    Vol Ratio : {inds.get('vol_ratio',1):.2f}x")
+            lines.append(f"    Avg Vol(20D): {inds.get('avg_volume_20d',0):,.0f} shares")
         if t.get("patterns"):
             lines.append(f"  CANDLESTICK PATTERNS: {', '.join(t['patterns'])}")
         lines.append("")
@@ -1493,7 +1580,7 @@ background:linear-gradient(90deg,#00d4ff,#00ff88);
 -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px;'>
 📈 Equity Trader Pro v2</h1>
 <p style='color:#64748b;font-size:0.85rem;margin-top:0;'>
-AI-Powered · Multi-Timeframe · Candlestick Patterns · RSI Divergence · Market Mood · Kelly Sizing · Trailing Stops</p>
+AI-Powered · Multi-Timeframe · Candlestick Patterns · RSI Divergence · Market Mood · Kelly Sizing · Trailing Stops · Volume Filter ≥1Cr</p>
 """, unsafe_allow_html=True)
 
 # ── Market Context Banner ─────────────────────────────────────────────────────
@@ -1540,6 +1627,14 @@ if vix > 20:
         unsafe_allow_html=True,
     )
 
+# Volume filter info banner
+st.markdown(
+    f'<div class="scan-info">📊 <b>Volume Filter Active:</b> Only stocks with avg 20-day volume '
+    f'≥ <b>1,00,00,000 (1 Crore)</b> shares are considered for signals and auto trading. '
+    f'Low-liquidity stocks are automatically excluded.</div>',
+    unsafe_allow_html=True,
+)
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
@@ -1562,6 +1657,15 @@ with st.sidebar:
     use_intraday_only = st.checkbox("🔒 Intraday Only (Square off at 3:15 PM)", value=True,
                                     help="Auto square-off all positions by 3:15 PM")
 
+    # Volume filter display (always ON, not user-toggleable — enforced in code)
+    st.markdown("---")
+    st.markdown(
+        '<div class="scan-info">📊 <b>Volume Filter</b><br>'
+        'Min Avg 20D Vol: <b>1,00,00,000</b><br>'
+        '<span style="font-size:0.75rem;color:#64748b;">Always active — cannot be disabled</span></div>',
+        unsafe_allow_html=True,
+    )
+
     st.markdown("---")
     st.markdown("### 🌐 NSE Universe")
     if st.button("🔄 Refresh NSE Symbol List", use_container_width=True):
@@ -1571,7 +1675,8 @@ with st.sidebar:
 
     all_nse = get_nse_symbols()
     st.markdown(
-        f'<div class="scan-info">📡 <b>{len(all_nse):,}</b> NSE symbols loaded</div>',
+        f'<div class="scan-info">📡 <b>{len(all_nse):,}</b> NSE symbols loaded<br>'
+        f'<span style="font-size:0.75rem;">Low-volume stocks filtered out at scan time</span></div>',
         unsafe_allow_html=True,
     )
 
@@ -1638,7 +1743,8 @@ with tabs[0]:
     st.markdown(
         f'<div class="scan-info">🌐 Scanning from <b>{len(effective_scan_universe)}</b> NSE symbols. '
         f'Enhanced signals: Market Mood ✓ Sector Filter ✓ Candlestick Patterns ✓ RSI Divergence ✓ '
-        f'Support/Resistance ✓ Fibonacci ✓</div>',
+        f'Support/Resistance ✓ Fibonacci ✓ | '
+        f'<b>📊 Volume Filter: Avg 20D Vol ≥ 1,00,00,000 ✓</b></div>',
         unsafe_allow_html=True,
     )
 
@@ -1669,7 +1775,7 @@ with tabs[0]:
         neutrals = [r for r in results if r["recommendation"] == "NEUTRAL"]
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.markdown(f'<div class="metric-card"><div class="metric-value accent">{len(results)}</div><div class="metric-label">Scanned</div></div>', unsafe_allow_html=True)
+        c1.markdown(f'<div class="metric-card"><div class="metric-value accent">{len(results)}</div><div class="metric-label">Passed Vol Filter</div></div>', unsafe_allow_html=True)
         c2.markdown(f'<div class="metric-card"><div class="metric-value green">{len(buys)}</div><div class="metric-label">BUY Signals</div></div>', unsafe_allow_html=True)
         c3.markdown(f'<div class="metric-card"><div class="metric-value red">{len(sells)}</div><div class="metric-label">SELL Signals</div></div>', unsafe_allow_html=True)
         c4.markdown(f'<div class="metric-card"><div class="metric-value yellow">{len(neutrals)}</div><div class="metric-label">Neutral</div></div>', unsafe_allow_html=True)
@@ -1687,6 +1793,7 @@ with tabs[0]:
             mom_1m   = rec.get("momentum_1m", 0) or 0
             patterns = [p[0] for p in rec.get("patterns", [])]
             div      = "✓" if rec.get("divergence") else ""
+            avg_vol  = rec.get("indicators", {}).get("avg_volume_20d", 0)
             table_data.append({
                 "Symbol":        rec["symbol"].replace(".NS",""),
                 "CMP (₹)":      f"₹{rec['cmp']:,.2f}",
@@ -1696,6 +1803,7 @@ with tabs[0]:
                 "Stop (₹)":     f"₹{rec['stop']:,.2f}",
                 "Day Chg (%)":   f"{day_chg:+.2f}%",
                 "1M Mom (%)":    f"{mom_1m:+.1f}%",
+                "Avg Vol (20D)": f"{avg_vol:,.0f}",
                 "Mode":          rec.get("market_mode", "N/A"),
                 "Patterns":      ", ".join(patterns) if patterns else "—",
                 "Divergence":    div,
@@ -1720,6 +1828,7 @@ with tabs[0]:
             patterns  = [p[0] for p in rec.get("patterns", [])]
             pat_str   = f" 🕯️{', '.join(patterns)}" if patterns else ""
             div_str   = " 📐DIV" if rec.get("divergence") else ""
+            avg_vol   = rec.get("indicators", {}).get("avg_volume_20d", 0)
 
             with st.expander(
                 f"{icon} {rec['symbol'].replace('.NS','')} | "
@@ -1728,12 +1837,20 @@ with tabs[0]:
                 f"{pat_str}{div_str}"
             ):
                 c1, c2, c3, c4, c5, c6 = st.columns(6)
-                c1.metric("CMP",       f"₹{rec['cmp']:,.2f}")
-                c2.metric("Signal",    rec["recommendation"])
-                c3.metric("Strength",  f"{rec['strength']}%")
-                c4.metric("Target",    f"₹{rec['target']:,.2f}")
-                c5.metric("Stop Loss", f"₹{rec['stop']:,.2f}")
-                c6.metric("Day Chg",   f"{day_chg:+.2f}%", delta=f"{day_chg:+.2f}%")
+                c1.metric("CMP",         f"₹{rec['cmp']:,.2f}")
+                c2.metric("Signal",      rec["recommendation"])
+                c3.metric("Strength",    f"{rec['strength']}%")
+                c4.metric("Target",      f"₹{rec['target']:,.2f}")
+                c5.metric("Stop Loss",   f"₹{rec['stop']:,.2f}")
+                c6.metric("Day Chg",     f"{day_chg:+.2f}%", delta=f"{day_chg:+.2f}%")
+
+                # Avg volume badge
+                st.markdown(
+                    f'<div class="scan-info" style="padding:6px 12px;margin-bottom:8px;">'
+                    f'📊 Avg 20D Volume: <b>{avg_vol:,.0f}</b> shares '
+                    f'{"✅ Passes filter" if avg_vol >= MIN_VOLUME_THRESHOLD else "⛔ Below threshold"}</div>',
+                    unsafe_allow_html=True,
+                )
 
                 # Strength bar
                 bar_color = "#00ff88" if rec["recommendation"] == "BUY" else "#ff3366"
@@ -1879,7 +1996,8 @@ with tabs[1]:
         f'<p style="color:#94a3b8;">Scans <b>{len(effective_scan_universe)}</b> NSE stocks · '
         f'Strongest signals only · Kelly position sizing · Trailing stops · '
         f'Time-based exits · Market mood filter · Sector rotation · '
-        f'Brokerage simulation · Earnings avoidance</p></div>',
+        f'Brokerage simulation · Earnings avoidance · '
+        f'<b>📊 Volume ≥ 1 Crore shares enforced</b></p></div>',
         unsafe_allow_html=True,
     )
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1898,7 +2016,8 @@ with tabs[1]:
                 f'Picks <b>top {int(auto_max_pos)} strongest signals ≥ {int(auto_min_str)}%</b><br>'
                 f'Kelly sizing: {"ON ✓" if use_kelly else "OFF"} | '
                 f'Market filter: {"ON ✓" if use_market_filter else "OFF"} | '
-                f'Sector filter: {"ON ✓" if use_sector_filter else "OFF"}</div>',
+                f'Sector filter: {"ON ✓" if use_sector_filter else "OFF"}<br>'
+                f'<b>📊 Volume filter: Avg 20D Vol ≥ 1,00,00,000 — Always ON</b></div>',
                 unsafe_allow_html=True,
             )
             st.markdown("<br>", unsafe_allow_html=True)
@@ -1945,7 +2064,7 @@ with tabs[1]:
             _capital = st.session_state.get("_auto_capital", 5000.0)
 
             if len(st.session_state.portfolio) < _max_pos and vix <= 25:
-                with st.spinner(f"🔭 Scanning {len(effective_scan_universe)} stocks…"):
+                with st.spinner(f"🔭 Scanning {len(effective_scan_universe)} stocks (Vol ≥ 1Cr filter active)…"):
                     try:
                         new_trades = auto_trade_step_multi(
                             effective_scan_universe,
@@ -2027,7 +2146,6 @@ with tabs[1]:
                 df_pos = pd.DataFrame(st.session_state.portfolio)
                 if "cmp" not in df_pos.columns:
                     df_pos["cmp"] = df_pos["entry_price"]
-                # Add trailing stop column
                 if "trailing_stop" not in df_pos.columns:
                     df_pos["trailing_stop"] = None
                 disp = [c for c in ["symbol","type","cmp","entry_price","qty","invested",
@@ -2044,10 +2162,11 @@ with tabs[1]:
                 badge     = "🟢 BUY" if t["type"] == "BUY" else "🔴 SELL"
                 setup     = t.get("setup_type", "")
                 trail_str = f" | Trail: ₹{t.get('trailing_stop'):,.2f}" if t.get("trailing_stop") else ""
+                avg_vol   = t.get("indicators", {}).get("avg_volume_20d", 0)
                 st.markdown(
                     f"- {badge} **{t['symbol'].replace('.NS','')}** | "
                     f"₹{t['cmp']:,.2f} | Strength **{t['strength']}%** | "
-                    f"Qty {t['qty']} | Setup: {setup}{trail_str}"
+                    f"Qty {t['qty']} | Setup: {setup} | Vol: {avg_vol:,.0f}{trail_str}"
                 )
 
             col_stop1, _ = st.columns([1, 3])
